@@ -209,3 +209,16 @@ __marimo__/
 # Project specific
 .python-version
 *.lock
+
+.agents
+.claude
+skills-lock.json
+*.pdf
+*.gz
+*.json*
+*.csv
+*.parquet
+*.pt
+*.duckdb*
+*.DS_Store
+checkpoints
