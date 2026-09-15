@@ -1,10 +1,12 @@
+from functools import partial
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import T5ForConditionalGeneration
 
-from tiger.dataset import TigerDataset
+from tiger.dataset import TigerDataset, custom_collate
 
 
 def tokens_to_asin(
@@ -216,6 +218,7 @@ def evaluate(
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
+        collate_fn=partial(custom_collate, pad_token_id=dataset.pad_token),
     )
 
     all_predictions: list[list[str]] = []

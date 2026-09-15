@@ -4,6 +4,7 @@ from typing import Literal
 import mmh3
 import pandas as pd
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 
@@ -134,16 +135,24 @@ class TigerDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.samples[idx]
 
-        # Pad encoder input to fixed length
-        encoder_input = sample["encoder_input"]
-        pad_len = self.max_encoder_len - len(encoder_input)
-        attention_mask = [1] * len(encoder_input) + [0] * pad_len
-        encoder_input = encoder_input + [self.pad_token] * pad_len
-
-        labels = sample["target"]
+        input_ids = torch.tensor(sample["encoder_input"], dtype=torch.long)
+        labels = torch.tensor(sample["target"], dtype=torch.long)
 
         return {
-            "input_ids": torch.tensor(encoder_input, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "labels": labels,
         }
+
+def custom_collate(batch: list[dict[str, torch.Tensor]], pad_token_id: int) -> dict[str, torch.Tensor]:
+    """Pad histories to the longest history in the current batch."""
+    input_ids = pad_sequence([item["input_ids"] for item in batch], batch_first=True, padding_value=pad_token_id)
+
+    attention_mask = (input_ids != pad_token_id).long()
+    labels = torch.stack([item["labels"] for item in batch])
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
