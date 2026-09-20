@@ -1,15 +1,8 @@
-from functools import partial
-
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from transformers import T5ForConditionalGeneration
-
-from tiger.dataset import TigerDataset, custom_collate
+from transformers import EvalPrediction
 
 
-def tokens_to_asin(
+def _tokens_to_asin(
     tokens: list[int],
     sid_to_asin: dict[tuple[int, ...], str],
     codebook_size: int = 256,
@@ -43,220 +36,144 @@ def tokens_to_asin(
     return sid_to_asin.get(tuple(codes))
 
 
-def compute_ranking_metrics(
-    predicted_items: list[list[str]],
-    ground_truth_items: list[str],
-    at_k: list[int] | None = None,
-) -> dict[str, float]:
-    """Compute Recall@K and NDCG@K for leave-one-out evaluation.
+def _check_metric_inputs(recommendations: list[list[str]], targets: list[str], k: int) -> None:
+    """Validate inputs shared by the ranking metrics."""
+    if k <= 0:
+        raise ValueError("k must be positive.")
+    if not targets:
+        raise ValueError("targets must contain at least one user.")
+    if len(recommendations) != len(targets):
+        raise ValueError("recommendations and targets must have equal lengths.")
 
-    For leave-one-out (one relevant item per user):
-    - Recall@K = 1 if GT in top-K, else 0. Averaged over all users.
-    - NDCG@K = 1/log2(pos+1) if GT at position pos (1-indexed) <= K,
-      else 0. IDCG@K = 1/log2(2) = 1, so NDCG simplifies to DCG.
 
-    Args:
-        predicted_items: Ranked predicted ASINs per user.
-        ground_truth_items: Ground truth ASIN per user (same length).
-        at_k: K values to compute (default [5, 10]).
+def recall_at_k(
+    recommendations: list[list[str]],
+    targets: list[str],
+    k: int,
+) -> float:
+    """Return mean Recall@K for one target item per user.
 
-    Returns:
-        {"recall@5": float, "ndcg@5": float, "recall@10": float, ...}
+    Each recommendation list contains unique items in ranked order.
+    Each user scores 1 if their target appears in the first K items,
+    otherwise 0. Empty recommendation lists score 0.
+
+    Raises:
+        ValueError: K is nonpositive, targets are empty, or user counts differ.
     """
-    if at_k is None:
-        at_k = [5, 10]
+    _check_metric_inputs(recommendations, targets, k)
 
-    results = {}
-
-    for k in at_k:
-        recalls = []
-        ndcgs = []
-
-        for gt, preds in zip(ground_truth_items, predicted_items):
-            top_k = preds[:k]
-            if gt in top_k:
-                recalls.append(1.0)
-                pos = top_k.index(gt) + 1
-                ndcgs.append(1.0 / np.log2(pos + 1))
-            else:
-                recalls.append(0.0)
-                ndcgs.append(0.0)
-
-        results[f"recall@{k}"] = float(np.mean(recalls))
-        results[f"ndcg@{k}"] = float(np.mean(ndcgs))
-
-    return results
-
-
-@torch.no_grad()
-def beam_search_retrieval(
-    model: T5ForConditionalGeneration,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    beam_size: int = 20,
-    num_return_sequences: int | None = None,
-    max_new_tokens: int = 4,
-) -> torch.Tensor:
-    """Run beam search to generate top-K semantic ID token sequences.
-
-    Args:
-        model: T5ForConditionalGeneration model in eval mode.
-        input_ids: Encoder input tokens (batch, seq_len).
-        attention_mask: Attention mask (batch, seq_len).
-        beam_size: Beam search width.
-        num_return_sequences: Sequences to return per input.
-            Defaults to beam_size. Must be <= beam_size.
-        max_new_tokens: Number of tokens to generate (== num_levels).
-
-    Returns:
-        Generated token sequences (batch, num_return_sequences,
-        max_new_tokens).
-    """
-    if num_return_sequences is None:
-        num_return_sequences = beam_size
-
-    outputs = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        num_beams=beam_size,
-        num_return_sequences=num_return_sequences,
-        max_new_tokens=max_new_tokens,
-        early_stopping=False,
-        output_scores=False,
-        return_dict_in_generate=False,
+    hits = sum(
+        target in items[:k]
+        for items, target in zip(recommendations, targets)
     )
-
-    batch_size = input_ids.shape[0]
-    generated = outputs[:, -max_new_tokens:]
-    return generated.view(batch_size, num_return_sequences, -1)
+    return hits / len(targets)
 
 
-def decode_semantic_ids(
-    generated_tokens: torch.Tensor,
-    sid_to_asin: dict[tuple[int, ...], str],
-    codebook_size: int = 256,
-    num_levels: int = 4,
-) -> list[list[str]]:
-    """Convert generated token sequences to valid, deduplicated ASIN lists.
+def ndcg_at_k(
+    recommendations: list[list[str]],
+    targets: list[str],
+    k: int,
+) -> float:
+    """Return mean NDCG@K for one target item per user.
 
-    Handles:
-    - Tokens outside valid semantic range (pad/EOS/user tokens)
-    - Semantic IDs not found in sid_to_asin (novel combinations)
-    - Duplicate ASINs from different beam paths converging
+    Each recommendation list contains unique items in ranked order.
+    A target at rank r <= K scores 1 / log2(r + 1), with ranks starting
+    at 1. Missing targets and empty recommendation lists score 0.
 
-    Args:
-        generated_tokens: (batch, num_return_sequences, num_levels).
-        sid_to_asin: Mapping from semantic ID tuple to ASIN.
-        codebook_size: Size of each codebook level.
-        num_levels: Number of levels in semantic ID.
-
-    Returns:
-        List per user: valid ASINs in beam order (deduplicated, first
-        occurrence kept).
+    Raises:
+        ValueError: K is nonpositive, targets are empty, or user counts differ.
     """
-    batch_predictions = []
+    _check_metric_inputs(recommendations, targets, k)
 
-    for batch_idx in range(generated_tokens.shape[0]):
-        seen_asins: set[str] = set()
-        valid_asins: list[str] = []
+    total = 0.0
 
-        for seq_idx in range(generated_tokens.shape[1]):
-            tokens = generated_tokens[batch_idx, seq_idx].tolist()
-            asin = tokens_to_asin(tokens, sid_to_asin, codebook_size, num_levels)
-            if asin is not None and asin not in seen_asins:
-                seen_asins.add(asin)
-                valid_asins.append(asin)
-
-        batch_predictions.append(valid_asins)
-
-    return batch_predictions
+    for items, target in zip(recommendations, targets):
+        top_k = items[:k]
+        if target in top_k:
+            rank = top_k.index(target) + 1
+            total += 1.0 / np.log2(rank + 1)
+    
+    return float(total / len(targets))
 
 
-@torch.no_grad()
-def evaluate(
-    model: T5ForConditionalGeneration,
-    dataset: TigerDataset,
+METRICS = {
+    "recall": recall_at_k,
+    "ndcg": ndcg_at_k,
+}
+
+
+def compute_metrics(
+    eval_pred: EvalPrediction,
+    *,
+    num_levels: int,
+    beam_size: int,
+    codebook_size: int,
     sid_to_asin: dict[tuple[int, ...], str],
-    device: torch.device,
-    batch_size: int = 256,
-    beam_size: int = 20,
-    at_k: list[int] | None = None,
-    max_new_tokens: int = 4,
-    verbose: bool = True,
+    at_k: tuple[int, ...] = (5, 10),
 ) -> dict[str, float]:
-    """Run full evaluation pipeline on a dataset split.
+    """Decode Seq2SeqTrainer generations and calculate ranking metrics.
 
-    Data flow per batch:
-    1. Load (input_ids, attention_mask, labels) from DataLoader
-    2. Run beam search -> top-K token sequences
-    3. Decode tokens -> ASINs
-    4. Collect all user predictions
-    Then compute macro-averaged Recall@K and NDCG@K.
+    Predictions contain `beam_size` candidate rows per user, in beam order.
+    Each row starts with START, followed by the Semantic ID.
+    Labels contain one Semantic ID per user, without START.
+    Trailing padding is ignored.
 
-    Args:
-        model: T5ForConditionalGeneration model in eval mode.
-        dataset: TigerDataset (typically val or test split).
-        sid_to_asin: Mapping from semantic ID tuple to ASIN.
-        device: Device for inference.
-        batch_size: Dataloader batch size.
-        beam_size: Beam search width.
-        at_k: K values for metrics.
-        max_new_tokens: Number of tokens to generate (== num_levels).
-        verbose: Show progress bar.
+    Invalid candidates and duplicate items are removed, preserving order.
+    Users without valid recommendations remain included in the scores.
 
     Returns:
-        {"recall@5": float, "ndcg@5": float, ...}
+        Mean metric values named like "recall@5" and "ndcg@5".
+
+    Raises:
+        ValueError: Configuration, prediction shape, or targets are invalid.
     """
-    if at_k is None:
-        at_k = [5, 10]
+    predictions, labels = eval_pred.predictions, eval_pred.label_ids
 
-    model.eval()
-    model.to(device)
+    if min(num_levels, beam_size, codebook_size) <= 0:
+        raise ValueError("ID dimensions and beam_size must be positive.")
+    if not at_k or any(k <= 0 for k in at_k):
+        raise ValueError("at_k must contain positive cutoffs.")
+    
+    for name, array in [("predictions", predictions), ("labels", labels)]:
+        if not isinstance(array, np.ndarray) or array.ndim != 2:
+            raise ValueError(f"{name} must be a 2D NumPy array.")
+        if not np.issubdtype(array.dtype, np.integer):
+            raise ValueError(f"{name} must contain integer token IDs.")
+    
+    num_users = len(labels)
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        collate_fn=partial(custom_collate, pad_token_id=dataset.pad_token),
-    )
+    if num_users == 0:
+        raise ValueError("Cannot evaluate an empty dataset.")
+    if predictions.shape[0] != num_users * beam_size:
+        raise ValueError("Expected beam_size generated sequences per user.")
+    if predictions.shape[1] < 1 + num_levels or labels.shape[1] < num_levels:
+        raise ValueError("Predictions or labels are shorter than the item ID.")
 
-    all_predictions: list[list[str]] = []
-    all_ground_truths: list[str] = []
+    # Remove START tokens and group each user's candidates together.
+    candidates = predictions[:, 1 : 1 + num_levels].reshape(num_users, beam_size, num_levels)
 
-    iterator = tqdm(dataloader, desc="Evaluating") if verbose else dataloader
+    recommendations: list[list[str]] = []
+    targets: list[str] = []
 
-    for batch in iterator:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"]
+    for index, (user_candidates, label) in enumerate(zip(candidates, labels)):
+        target = _tokens_to_asin(label[:num_levels].tolist(), sid_to_asin, codebook_size, num_levels)
+        if target is None:
+            raise ValueError(f"Unknown target Semantic ID at row {index}.")
+        targets.append(target)
 
-        # Step 1: Beam search
-        generated = beam_search_retrieval(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            beam_size=beam_size,
-            num_return_sequences=beam_size,
-            max_new_tokens=max_new_tokens,
-        )
+        items: list[str] = []
+        seen: set[str] = set()
 
-        # Step 2: Decode tokens -> ASINs per user
-        batch_preds = decode_semantic_ids(
-            generated.cpu(),
-            sid_to_asin,
-            dataset.codebook_size,
-            dataset.num_levels,
-        )
-        all_predictions.extend(batch_preds)
-
-        # Step 3: Decode ground truth labels -> ASINs
-        for label_seq in labels:
-            gt_tokens = label_seq.tolist()
-            gt_asin = tokens_to_asin(
-                gt_tokens, sid_to_asin, dataset.codebook_size, dataset.num_levels
-            )
-            all_ground_truths.append(gt_asin if gt_asin else "UNKNOWN")
-
-    # Step 4: Compute metrics
-    return compute_ranking_metrics(all_predictions, all_ground_truths, at_k)
+        for candidate in user_candidates:
+            item = _tokens_to_asin(candidate.tolist(), sid_to_asin, codebook_size, num_levels)
+            if item is not None and item not in seen:
+                items.append(item)
+                seen.add(item)
+        
+        recommendations.append(items)
+    
+    return {
+        f"{name}@{k}": metric(recommendations, targets, k)
+        for name, metric in METRICS.items()
+        for k in at_k
+    }
