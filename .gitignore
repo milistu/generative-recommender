@@ -208,7 +208,6 @@ __marimo__/
 
 # Project specific
 .python-version
-*.lock
 
 .agents
 .claude

@@ -1,8 +1,11 @@
 [project]
-name = "generativerecs"
+name = "generative-recs"
 version = "0.1.0"
-description = "Implementation of Recommender Systems with Generative Retrieval"
+description = "Build, train, and evaluate generative recommender systems"
 readme = "README.md"
+authors = [
+    { name = "Milutin Studen", email = "81291567+milistu@users.noreply.github.com" }
+]
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.13.0",
@@ -23,3 +26,10 @@ dependencies = [
 dev = [
     "jupyter>=1.1.1",
 ]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""

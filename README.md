@@ -1,6 +1,7 @@
-# Generative Recommender Systems
+# Generative Recs
 
-Implementation of [Recommender Systems with Generative Retrieval](https://arxiv.org/abs/2305.05065) (NeurIPS 2023). The method is referred to as **TIGER** (Transformer Index for GEnerative Recommenders).
+Build, train, and evaluate generative recommender systems.
+Starting with a reproduction of [Recommender Systems with Generative Retrieval](https://arxiv.org/abs/2305.05065) (NeurIPS 2023). The method is referred to as **TIGER** (Transformer Index for GEnerative Recommenders).
 
 ## Setup
 
